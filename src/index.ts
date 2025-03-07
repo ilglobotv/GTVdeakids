@@ -22,8 +22,17 @@ interface Asset {
 }
 interface Channel extends nano.MaybeDocument {
   channelId: string;
+  houseAdUrls?: {
+    url: string;
+    duration: number;
+  }[],
   position: number;
   assets: Asset[];
+}
+interface Break {
+  pos: number;
+  duration: number;
+  url: string;
 }
 
 async function getDbUrl(channelDb: string) {
@@ -47,43 +56,58 @@ async function connect(dbUrl: string) {
   return db;
 }
 
-async function getAssetsForChannel(db: nano.DocumentScope<unknown>, channelId: string): Promise<Asset[]> {
+async function getChannelById(db: nano.DocumentScope<unknown>, channelId: string): Promise<Channel|undefined> {
   const res = await db.find({ selector: { channelId: { "$eq": channelId } } });
   if (res.docs.length > 0) {
-    const channel = res.docs[0] as Channel;
-    return channel.assets;
+    return res.docs[0] as Channel;
   }
-  return [];
+  return undefined;
 }
 
 async function getPositionForChannel(db: nano.DocumentScope<unknown>, channelId: string): Promise<number> {
-  const res = await db.find({ selector: { channelId: { "$eq": channelId } } });
-  if (res.docs.length > 0) {
-    const channel = res.docs[0] as Channel;
+  const channel = await getChannelById(db, channelId);
+  if (channel) {
     return channel.position;
   }
   return -1;
 }
 
 async function updatePositionForChannel(db: nano.DocumentScope<unknown>, channelId: string, position: number) {
-  const res = await db.find({ selector: { channelId: { "$eq": channelId } } });
-  if (res.docs.length > 0) {
-    const channel = res.docs[0] as Channel;
+  const channel = await getChannelById(db, channelId);
+  if (channel) {
     channel.position = position;
     await db.insert(channel);
   }
 }
 
-async function getStitchedVod(stitcherUrl: string, asset: Asset): Promise<string> {
-  const payload = {
-    uri: asset.url,
-    breaks: asset.breaks.map((b) => {
+async function getStitchedVod(stitcherUrl: string, asset: Asset, channel?: Channel): Promise<string> {
+  let breaks: Break[] = [];
+  if (channel && channel.houseAdUrls) {
+    asset.breaks.forEach((b) => {
+      let pos = b * 1000;
+      if (channel.houseAdUrls) {
+        channel.houseAdUrls.forEach((ad) => {
+          breaks.push({
+            pos,
+            duration: ad.duration,
+            url: ad.url
+          });
+          pos += ad.duration;
+        });
+      }
+    });
+  } else {
+    breaks = asset.breaks.map((b) => {
       return {
         pos: b * 1000,
         duration: FILLER_URL_DURATION_SEC * 1000,
         url: FILLER_URL
       }
-    })
+    });
+  }
+  const payload = {
+    uri: asset.url,
+    breaks
   };
   const res = await fetch(stitcherUrl, {
     method: 'POST',
@@ -123,7 +147,12 @@ async function main() {
     const channelId = request.query.channelId;
     if (channelId) {
       console.log(`Requesting next VOD for channel ${channelId}`);
-      const assets = await getAssetsForChannel(db, channelId);
+      const channel = await getChannelById(db, channelId);
+      if (!channel) {
+        reply.code(404).send({ error: `Channel ${channelId} not found` });
+        return;
+      }
+      const assets = channel.assets || [];
       // Currently just choose one at random
       const position = await getPositionForChannel(db, channelId);
       let newPosition;
@@ -137,7 +166,7 @@ async function main() {
         newPosition = position + 1;
       }
       const asset = assets[newPosition];
-      const hlsUrl = await getStitchedVod(stitcherUrl, asset);
+      const hlsUrl = await getStitchedVod(stitcherUrl, asset, channel);
       await updatePositionForChannel(db, channelId, newPosition);
       reply.code(200).send({
         id: asset.id,
